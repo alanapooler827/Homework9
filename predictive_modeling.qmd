@@ -9,10 +9,12 @@ editor: visual
 Import libraries
 
 ```{r}
+#| warning: false
 library(tidyverse)
 library(tidymodels)
 library(ggplot2)
 library(baguette)
+library(rpart.plot)
 
 # suppress scientific notation
 options(scipen=999)
@@ -27,10 +29,8 @@ df <- read_csv("SeoulBikeData.csv", locale = locale(encoding = "ISO-8859-1"))
 head(df)
 ```
 
-Data Cleaning
-- Convert 'Date' column to date type
-- Convert remaining 3 categorical variables to factors
-- Rename columns to be consistent & easy to use
+Data Cleaning - Convert 'Date' column to date type - Convert remaining 3 categorical variables to factors - Rename columns to be consistent & easy to use
+
 ```{r}
 df$Date <- dmy(df$Date)
 
@@ -107,6 +107,7 @@ train_10_fold <- vfold_cv(train, 10)
 ```
 
 Create recipe to use in models
+
 ```{r}
 rec <- recipe(total_rented_bike_count ~ ., data = train) |>
   # create day of week variable
@@ -124,12 +125,10 @@ rec <- recipe(total_rented_bike_count ~ ., data = train) |>
   step_dummy(season, holiday, day_type)
 ```
 
-
 ### LASSO Model
 
-Create LASSO model instance and workflow
-- Use 'penalty = tune()' to indicate that we are going to be tuning the model
-- use 'mixture = 1' to turn this into a LASSO model rather than elastic net
+Create LASSO model instance and workflow - Use 'penalty = tune()' to indicate that we are going to be tuning the model - use 'mixture = 1' to turn this into a LASSO model rather than elastic net
+
 ```{r}
 LASSO_spec <- linear_reg(penalty = tune(), mixture = 1) |>
   set_engine("glmnet")
@@ -140,37 +139,357 @@ LASSO_wkf <- workflow() |>
   add_model(LASSO_spec)
 ```
 
-Fit tuned LASSO model 
+Fit tuned LASSO model & plot metrics across each fold
+
+Each tuning value has the same RMSE, so use a small number of levels to shorten run time
+
 ```{r}
 LASSO_grid <- LASSO_wkf |>
   tune_grid(resamples = train_10_fold,
-            grid = grid_regular(penalty(), levels = 100)) 
-LASSO_grid
-```
+            grid = grid_regular(penalty(), levels = 10),
+            metrics = metric_set(rmse, mae)) 
 
-Plot metrics computed across each fold for each of the 100 tuning parameters
 
-Each tuning value has the same RMSE
-```{r}
 LASSO_grid |>
   collect_metrics() |>
-  filter(.metric == "rmse") |>
   ggplot(aes(penalty, mean, color = .metric)) +
   geom_line()
 ```
 
-Select the model with the lowest MRSE
+Since all of the models perform the same, we will just select the first one to finalize
+
 ```{r}
 LASSO_best <- LASSO_grid |>
-  select_best(metric = "rmse")
+  collect_metrics() |>
+  slice(1)
 ```
 
 Finalize the workflow fit the best model to the entire training set
+
 ```{r}
 LASSO_final <- LASSO_wkf |>
   finalize_workflow(LASSO_best) |>
-  last_fit(data_split)
+  last_fit(data_split, metrics = metric_set(rmse, mae))
 
 LASSO_final |>
   collect_metrics()
+```
+
+### Regression Tree Model
+
+Create Regression Tree model instance and workflow
+
+The first run of this model using tune() for all 3 parameters of decision_tree() took a long time to run and there was no improvement when using a tree depth higher than 8. Based on these results, I specified the value of tree depth to reduce run time.
+
+```{r}
+reg_tree <- 
+  decision_tree(
+    tree_depth = 8,
+    min_n = tune(),
+    cost_complexity = tune()
+  ) |>
+  set_engine('rpart') |>
+  set_mode('regression')
+
+# workflow
+reg_tree_wkf <- workflow() |>
+  add_recipe(rec) |>
+  add_model(reg_tree)
+```
+
+Fit the workflow on CV folds
+
+Use 5 of each tuning parameter (cost_complexity and min_n)
+
+```{r}
+reg_tree_fit <- reg_tree_wkf |> 
+  tune_grid(resamples = train_10_fold,
+            grid = grid_regular(min_n(),
+                                cost_complexity(),
+                                levels = c(5, 5)),
+            # specify metrics to use
+            metrics = metric_set(rmse, mae))
+
+# view metrics for each fold
+reg_tree_fit |>
+  collect_metrics(type = 'wide') |>
+  arrange(rmse, mae)
+```
+
+Plot metrics
+
+There is significant improvement in RMSE and MAE between min_n = 2 and min_n = 11. After that, we see much smaller differences between values of min_n with min_n = 40 having the lowest RMSE and MAE. We also see an uptick in RMSE and MAE between the values of 0.00001 and 0.01 for cost complexity (except for the RMSE from the model with min_n = 2, where RMSE falls between those two values).
+
+```{r}
+reg_tree_fit |>
+  collect_metrics() |>
+  mutate(min_n = factor(min_n)) |>
+  ggplot(aes(cost_complexity, mean, color = min_n)) +
+  geom_line(size = 1.5, alpha = 0.6) +
+  geom_point(size = 2) +
+  facet_wrap(~ .metric, scales = "free", nrow = 2) +
+  scale_x_log10(labels = scales::label_number()) +
+  scale_color_viridis_d(option = "plasma", begin = .9, end = 0)
+```
+
+Select the best model
+
+```{r}
+reg_tree_best <- reg_tree_fit |>
+  select_best(metric = "rmse")
+reg_tree_best
+```
+
+Finalize the workflow with the best model and fit to the training data
+
+```{r}
+reg_tree_final <- reg_tree_wkf |>
+  finalize_workflow(reg_tree_best) |>
+  last_fit(data_split, metrics = metric_set(rmse, mae))
+
+reg_tree_final |>
+  collect_metrics()
+```
+
+### Bagged Tree Model
+
+Create Bagged Tree model instance and workflow
+
+Tuning all 3 parameters takes a very long time to run, so ran it once and then specified the tree_depth and min_n based off of those results.
+
+```{r}
+bag_spec <- bag_tree(tree_depth = 10,
+                     min_n = 6,
+                     cost_complexity = tune()) |>
+  set_engine('rpart') |>
+  set_mode('regression')
+
+# workflow
+bag_wkf <- workflow() |>
+  add_recipe(rec) |>
+  add_model(bag_spec)
+```
+
+Fit model to CV folds & view metrics across each fold
+
+```{r}
+bag_fit <- bag_wkf |>
+  tune_grid(resamples = train_10_fold,
+            grid = grid_regular(cost_complexity(), levels = 10),
+            metrics = metric_set(rmse, mae))
+
+bag_fit |>
+  collect_metrics(type = 'wide') |>
+  arrange(rmse, mae)
+```
+
+Select the best model
+
+```{r}
+bag_best <- bag_fit |>
+  select_best(metric = "rmse")
+bag_best
+```
+
+Finalize the workflow and fit the best model on the full training set
+
+```{r}
+bag_final <- bag_wkf |>
+  finalize_workflow(bag_best) |>
+  last_fit(data_split, metrics = metric_set(rmse, mae))
+
+bag_final |>
+  collect_metrics()
+```
+
+### Random Forest Model
+
+Create Random Forest model instance and workflow
+
+Use importance = "impurity" to request variable importance calculation
+
+```{r}
+rf_spec <- 
+  rand_forest(mtry = tune(),
+              min_n = tune(),
+              trees = tune()) |>
+  set_engine('ranger', importance = "impurity") |>
+  set_mode('regression')
+
+rf_wkf <- workflow() |>
+  add_recipe(rec) |>
+  add_model(rf_spec)
+```
+
+Fit model to CV folds & view metrics
+
+```{r}
+rf_fit <- rf_wkf |>
+  tune_grid(
+    resamples = train_10_fold,
+    grid = 10,
+    metrics = metric_set(rmse, mae))
+
+rf_fit |>
+  collect_metrics(type = 'wide') |>
+  arrange(rmse, mae)
+```
+
+Select the best model
+
+```{r}
+rf_best <- rf_fit |>
+  select_best(metric = 'rmse')
+rf_best
+```
+
+Finalize workflow for the best model and fit to the full training set
+
+```{r}
+rf_final <- rf_wkf |>
+  finalize_workflow(rf_best) |>
+  last_fit(data_split, metrics = metric_set(rmse, mae))
+
+rf_final |>
+  collect_metrics()
+```
+
+### MLR Model
+
+Use recipe 3 from homework 8
+
+```{r}
+mlr_rec <- rec |>
+  step_interact(terms = ~ starts_with('season'):starts_with('holiday')+ 
+                  starts_with('season'):mean_temp +
+                  mean_temp:mean_rainfall) |> 
+  step_poly(
+    all_numeric_predictors(),
+    # do not add quadratic term for dummy variables 
+    -starts_with("season_"),
+    -starts_with("holiday_"),
+    -starts_with("day_type"),
+    degree = 2
+  )
+```
+
+Create model instance and workflow
+
+```{r}
+mlr_spec <- linear_reg() |>
+ set_engine('lm')
+
+mlr_wkf <- 
+  workflow() |>
+  add_model(mlr_spec) |>
+  add_recipe(mlr_rec)
+```
+
+Fit model and view metrics
+
+```{r}
+# fit model using 10 fold CV
+mlr_fit <- mlr_wkf |>
+  fit_resamples(
+    resamples = train_10_fold,
+    metrics = metric_set(rmse, mae)
+  )
+
+# view metrics
+collect_metrics(mlr_fit, type = 'wide') |> 
+  arrange(rmse, mae)
+```
+
+## Model Comparison
+
+Compare MAE and RMSE for each model
+
+The random forest model has the lowest RMSE and MAE out of the 5 models.
+
+```{r}
+rbind(
+  LASSO_final |>
+    collect_metrics() |> 
+    mutate(Model = "LASSO", .before = ".metric"),
+  reg_tree_final |>
+    collect_metrics() |> 
+    mutate(Model = "TREE", .before = ".metric"),
+  bag_final |> 
+    collect_metrics() |> 
+    mutate(Model = "BAGGED", .before = ".metric"),
+  rf_final |>
+    collect_metrics() |> 
+    mutate(Model = "RF", .before = ".metric")
+)
+```
+
+## Model Summaries
+
+LASSO Model coefficient table
+
+```{r}
+LASSO_final |>
+  extract_fit_parsnip() |>
+  tidy()
+```
+
+MLR Model coefficient table
+
+```{r}
+MLR_final |>
+  extract_fit_parsnip() |>
+  tidy()
+```
+
+Plot of Regression Tree model final fit
+
+```{r}
+extract_fit_engine(reg_tree_final) |>
+  rpart.plot(roundint = FALSE)
+```
+
+Bagged Tree Model variable importance plot
+
+Temperature is the strongest predictor by far, which makes sense when looking at rented bike counts.
+
+Dew point and solar radiation are higher in the ranking than I anticipated, but it makes sense since riding bikes is more common in dry, sunny weather.
+
+I am also surprised by the difference in importance between the seasons. Winter is much more valuable as a predictor than spring and summer are.
+
+```{r}
+bag_extract <- extract_fit_engine(bag_final)
+
+bag_extract$imp |>
+  mutate(term = factor(term, levels = term)) |>
+  ggplot(aes(x = term, y = value)) +
+  geom_bar(stat ="identity", fill = 'deepskyblue4') +
+  coord_flip()
+```
+
+Random Forest Model variable importance plot
+
+This result is pretty similar to the bagged tree model variable importance plot. Temperature is the most important predictor and 'holiday_No.Holiday' is the least important, as was the case with the bagged tree model. In this model, season_Winter and dew point temperature have switched places and total snowfall has a lower importance.
+
+```{r}
+rf_extract <- extract_fit_engine(rf_final)
+
+rf_imp <- enframe(rf_extract$variable.importance,
+                  name = "term",
+                  value = "value")
+
+rf_imp |>
+  mutate(term = reorder(term, value, decreasing = TRUE)) |>
+  ggplot(aes(x = term, y = value)) +
+  geom_bar(stat ="identity", fill = 'deepskyblue4') +
+  coord_flip()
+```
+
+## Overall best fit
+
+The random forest model performed the best on the test set, so now we will fit it to the entire data set
+
+```{r}
+rf <- rf_wkf |>
+  finalize_workflow(rf_best) |>
+  fit(data)
 ```
