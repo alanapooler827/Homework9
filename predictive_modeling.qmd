@@ -1,0 +1,176 @@
+---
+title: "Homework 9: Modeling Practice"
+author: "Alana Pooler"
+date: '2025-11-14'
+format: html
+editor: visual
+---
+
+Import libraries
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(ggplot2)
+library(baguette)
+
+# suppress scientific notation
+options(scipen=999)
+```
+
+Read in data
+
+```{r}
+df <- read_csv("SeoulBikeData.csv", locale = locale(encoding = "ISO-8859-1"))
+
+# View first few rows of data
+head(df)
+```
+
+Data Cleaning
+- Convert 'Date' column to date type
+- Convert remaining 3 categorical variables to factors
+- Rename columns to be consistent & easy to use
+```{r}
+df$Date <- dmy(df$Date)
+
+df <- df |>
+  # convert categorical variables to factors
+  mutate(across(c('Seasons', 'Holiday', 'Functioning Day'), as.factor)) |>
+  # rename columns
+  rename('date' = 'Date',
+         'rented_bike_count' = 'Rented Bike Count',
+         'hour' = 'Hour',
+         'temp' = 'Temperature(°C)',
+         'humidity' = 'Humidity(%)',
+         'wind_speed' = 'Wind speed (m/s)',
+         'visibility' = 'Visibility (10m)',
+         'dew_pt_temp' = 'Dew point temperature(°C)',
+         'solar_rad' = 'Solar Radiation (MJ/m2)',
+         'rainfall' = 'Rainfall(mm)',
+         'snowfall' = 'Snowfall (cm)',
+         'season' = 'Seasons',
+         'holiday' = 'Holiday',
+         'functioning_day' = 'Functioning Day')
+```
+
+Summarize variables across hours so that each day has one record
+
+-   Calculate daily totals of rented bike count, rainfall, and snowfall
+
+-   Calculate daily averages of all remaining weather related variables.
+
+```{r}
+data <- df |>
+  group_by(date, season, holiday) |>
+  summarize(
+    across(
+      c(rented_bike_count, rainfall, snowfall),
+      ~ sum(.x),
+      .names = "total_{.col}"
+  ),
+    across(
+      c(temp, humidity, wind_speed, visibility, dew_pt_temp, solar_rad),
+      ~ mean(.x),
+      .names = "mean_{.col}"),
+  .groups = 'drop')
+```
+
+## Predictive Modeling
+
+Set the seed to ensure results are reproducible
+
+```{r}
+set.seed(42)
+```
+
+#### Prepare data for modeling
+
+Split the data into a training and test set using 75% of the data for the training set
+
+```{r}
+# put 75% of the data in the training set
+data_split <- initial_split(data, prop = .75, strata = season)
+
+# create data frames for the two sets
+train <- training(data_split)
+test <- testing(data_split)
+```
+
+Create 10 fold cross validation split on the training data
+
+There will be 26 observations per fold, except for the last fold, which will have 29 observations.
+
+```{r}
+# set up 10 fold cross validation
+train_10_fold <- vfold_cv(train, 10)
+```
+
+Create recipe to use in models
+```{r}
+rec <- recipe(total_rented_bike_count ~ ., data = train) |>
+  # create day of week variable
+  step_date(date, features = 'dow') |>
+  # convert to weekday/weekend factor
+  step_mutate(
+    day_type = factor(
+      if_else(date_dow %in% c('Sat', 'Sun'), 'Weekend', 'Weekday')
+    )
+  ) |>
+  # remove date and intermediate date variable created by step_date
+  step_rm(date, date_dow) |>
+  # standardize numeric variables
+  step_normalize(all_numeric_predictors()) |>
+  step_dummy(season, holiday, day_type)
+```
+
+
+### LASSO Model
+
+Create LASSO model instance and workflow
+- Use 'penalty = tune()' to indicate that we are going to be tuning the model
+- use 'mixture = 1' to turn this into a LASSO model rather than elastic net
+```{r}
+LASSO_spec <- linear_reg(penalty = tune(), mixture = 1) |>
+  set_engine("glmnet")
+
+# workflow
+LASSO_wkf <- workflow() |>
+  add_recipe(rec) |>
+  add_model(LASSO_spec)
+```
+
+Fit tuned LASSO model 
+```{r}
+LASSO_grid <- LASSO_wkf |>
+  tune_grid(resamples = train_10_fold,
+            grid = grid_regular(penalty(), levels = 100)) 
+LASSO_grid
+```
+
+Plot metrics computed across each fold for each of the 100 tuning parameters
+
+Each tuning value has the same RMSE
+```{r}
+LASSO_grid |>
+  collect_metrics() |>
+  filter(.metric == "rmse") |>
+  ggplot(aes(penalty, mean, color = .metric)) +
+  geom_line()
+```
+
+Select the model with the lowest MRSE
+```{r}
+LASSO_best <- LASSO_grid |>
+  select_best(metric = "rmse")
+```
+
+Finalize the workflow fit the best model to the entire training set
+```{r}
+LASSO_final <- LASSO_wkf |>
+  finalize_workflow(LASSO_best) |>
+  last_fit(data_split)
+
+LASSO_final |>
+  collect_metrics()
+```
